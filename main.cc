@@ -353,17 +353,13 @@ void sendTemp() {
   sendDec((long)temp100ths, "\n");
 }
 
+const uint PPS_WDT_Ticks = 32768;  // interrupt processing takes ~7 ticks
 
 const int NumOsc = 4;
-
-
 long NomHz[NumOsc];
 
-llong xtalTicks[NumOsc];
-long secs[NumOsc] = {-1, -1, -1, -1};
-
-long reportSecs = 2;
-
+volatile llong xtalTicks[NumOsc];
+volatile long secs[NumOsc] = {-1, -1, -1, -1};
 volatile int edgeReady;
 
 bool oscIntrpt(int TIVs, int oscIdx, uint TCCR1) {  // returns sample ready
@@ -396,11 +392,20 @@ bool oscIntrpt(int TIVs, int oscIdx, uint TCCR1) {  // returns sample ready
 
   // sample ready:
 	counts[oscIdx].LSW = TCCR1;
-	if (++secs[oscIdx] > 0)
-		xtalTicks[oscIdx] = counts[oscIdx].llongv - initial[oscIdx];
-	else 	initial[oscIdx] = counts[oscIdx].llongv;
 
-	TA2CCR0 = TA2R + 32768 + 2;
+	if (secs[oscIdx] > 0) {
+		int ppsWindow = (TA2CCR0 - TA2R + 8) & 0x7FFF;
+		if (ppsWindow > 16) { // filter excess 1PPS edges
+			sendDec((long)ppsWindow);
+			send('x'); // 1PPS glitch
+			return false;
+		}
+	}
+	TA2CCR0 = TA2R + PPS_WDT_Ticks;  // last serviced will be ~7 ticks late
+
+	if (++secs[oscIdx] > 0) {
+		xtalTicks[oscIdx] = counts[oscIdx].llongv - initial[oscIdx];
+	} else 	initial[oscIdx] = counts[oscIdx].llongv;
 
 	edgeReady |= 1 << oscIdx;
 	return true;
@@ -420,10 +425,11 @@ __interrupt void TIMER1_A1_ISR_HOOK(void) {
 }
 
 #pragma vector=TIMER2_A0_VECTOR
-__interrupt void TIMER2_A0_ISR_HOOK(void) {  // 32KHz
-	// 1PPS watchdog
+__interrupt void TIMER2_A0_ISR_HOOK(void) {  // 1PPS watchdog
+  TA2CCR0 = TA2R + PPS_WDT_Ticks;  // next watchdog
 	for (uint osc = 0; osc < NumOsc; ++osc)
 		++secs[osc];
+	send('.'); // missed 1PPS
 }
 
 #pragma vector=TIMER2_A1_VECTOR
@@ -448,7 +454,7 @@ void init1PPS() {
   TA2CTL = TASSEL_1 | MC_2 | TACLR | TAIE; // ACLK
   TA0CCTL1 = TA1CCTL1 = TA2CCTL1 = TB0CCTL1 = CM_1 | SCS | CAP | CCIE; // rising edge
 
-  TA2CCR0 = TA2R + 32768 + 2;
+  TA2CCR0 = TA2R + PPS_WDT_Ticks;
   TA2CCTL0 = CCIE;  // 1PPS watchdog
 }
 
@@ -486,7 +492,7 @@ bool setNomHz(int osc) {
 	int f = 0;
 	if (labs(Hz - (Hz + 50000) / 100000 * 100000) <= Hz / K1100tol)   // within 1kHz of N * 100kHz
 		Hz = (Hz + 50000) / 100000 * 100000;
-	//else if (labs(Hz - (Hz + 102400 / 2) / 102400 * 102400) <= Hz / K1100tol)  // pass ~1% of values
+	//else if (labs(Hz - (Hz + 102400 / 2) / 102400 * 102400) <= Hz / K1100tol)  // pass only ~1% of values but still some wrong
   //	Hz = (Hz + 102400 / 2) / 102400 * 102400;  // baud xtals
 	else { // check list of remaining frequencies
 		do {
@@ -517,14 +523,16 @@ bool setNomHz(int osc) {
 void reportMHz() {
 	bool newXtal = false;
 	for (uint osc = 0; osc < NumOsc; ++osc) {
-		if (secs[osc] <= 0) return;
+		if (secs[osc] <= 0)
+			return;
 		if (NomHz[osc] <= 0)
 			newXtal |= setNomHz(osc);
 	}
-	if (newXtal) send('\n');
+	if (newXtal) send(" xtal Hz\n");
 
 	for (uint osc = 0; osc < NumOsc; ++osc) {
 		const long resolution = 1000000000; // PPB
+		//TODO: first PPM error report differs from others
 		long ppRes = (xtalTicks[osc] - (llong)NomHz[osc] * secs[osc]) * resolution / secs[osc] / NomHz[osc];
 	  sendDec((long)(ppRes / (resolution / 1000000)), "."); // PPM
 	  sendDec((long)(abs(ppRes) % (resolution / 1000000)), ", ", 3);  // digits beyond PPM decimal
@@ -533,13 +541,14 @@ void reportMHz() {
   sendTemp();
 }
 
+long reportSecs = 2;
 const uint measSecs = 1000;  // 17 minutes
 
 void chk1PPS() {
 	if (secs[2] > 0 && !(secs[2] % reportSecs) || secs[2] >= measSecs) {
     reportMHz();
     if (secs[2] >= measSecs) {
-       secs[0] = secs[1]= secs[2] = secs[3] = -1; // new measurements
+       secs[0] = secs[1] = secs[2] = secs[3] = -1; // new measurements
        reportSecs = measSecs;
     } else reportSecs <<= 1;
 	}
@@ -585,10 +594,11 @@ void main() {
   identify();
 
 	UCA0IE |= UCRXIE;
-  __bis_SR_register(GIE);
 
   init1PPS();
   initADC();
+
+  __bis_SR_register(GIE);
 
   while (1) {
   	__bis_SR_register(LPM0_bits); // wait for 1 PPS or keystroke
