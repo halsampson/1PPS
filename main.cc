@@ -26,6 +26,7 @@ const ulong CPUHz = 4 * (8 * BaudRate);  // 8 * 921600 = 225 * 32768
 const ulong XtalHz = 32768L;
 
 // P1 pins
+#define XtalA0   BIT0  // TA1CLK  // pin 18
 #define OnePPSA0 BIT2  // CCI0A   // pin 20
 #define XtalA1   BIT6  // TA1CLK  // pin 24
 
@@ -35,16 +36,15 @@ const ulong XtalHz = 32768L;
 #define OnePPSA2 BIT4  // CCI2A   // pin 30
 
 // P3 pins:
-#define TxD			BIT3  // pin 37
-#define RxD			BIT4  // pin 38
+#define TxD			  BIT3  // pin 37
+#define RxD			  BIT4  // pin 38
 
 // P4 pins
-#define OnePPSB BIT6  // pin 47
-#define XtalB   BIT7  // pin 48
+#define OnePPSB  BIT7  // pin 48 - corner
 
 // P5 pins:
-#define XIN 		BIT4
-#define XOUT	  BIT5
+#define XIN 		  BIT4
+#define XOUT	    BIT5
 
 
 
@@ -183,8 +183,7 @@ void initPins() {
 
 	PMAPKEYID = PMAPKEY;
 	PMAPCTL = PMAPRECFG;
-	P4MAP6 = PM_TB0CCR1A;
-	P4MAP7 = PM_TB0CLK;
+	P4MAP7 = PM_TB0CCR1A;
 }
 
 
@@ -369,7 +368,8 @@ void sendTemp() {
   sendDec((long)temp100ths, "\n");
 }
 
-const uint PPS_WDT_Ticks = 32768 + 2;
+const uint watchdogMargin = 2;
+const uint PPS_WDT_Ticks = 32768 + watchdogMargin;
 
 const int NumOsc = 4;
 long NomHz[NumOsc];
@@ -410,14 +410,14 @@ bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
 
   // 1 PPS edge:
   static bool onePPSglitch;
-	if (oscIdx == 0)  {// first serviced
-	  uint residual = TA0CCR0 - TA0R;
-	  // TODO: residual will increase on each missing pulse
-		if (secs[0] > 0 && !missed1PPS && (onePPSglitch = residual > 4)) {
+	if (oscIdx == 0)  {// first serviced = TB0
+	  uint residual = TB0CCR0 - TB0R; // watchdog time left: should be near watchdogMargin
+	  // residual increases on each missing pulse
+		if (secs[0] > 0 && !missed1PPS && (onePPSglitch = residual > watchdogMargin + 1)) {
 			sendHex(residual);
 			return;
 		}
-		TA0CCR0 = TA0R + PPS_WDT_Ticks;
+		TB0CCR0 = TB0R + PPS_WDT_Ticks;
 		missed1PPS = false;
 	}
 	if (onePPSglitch) return;
@@ -432,53 +432,55 @@ bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
 	return true;
 }
 
+// interrupts from highest to lowest priority:
 
-#pragma vector=TIMER0_A0_VECTOR
-__interrupt void TIMER0_A0_ISR_HOOK(void) {  // 1PPS watchdog
-  TA0CCR0 = TA0R + PPS_WDT_Ticks;  // next watchdog to keep rough time
+#pragma vector=TIMER0_B0_VECTOR
+__interrupt void TIMER0_B0_ISR_HOOK(void) {  // 1PPS watchdog
+  TB0CCR0 = TB0R + PPS_WDT_Ticks;  // next watchdog to keep rough time
 	for (uint osc = 0; osc < NumOsc; ++osc)
 		++secs[osc];
 	missed1PPS = true;
-	// send('.'); // missed 1PPS
-}
-
-#pragma vector=TIMER0_A1_VECTOR
-__interrupt void TIMER0_A1_ISR_HOOK(void) {
-	if (oscIntrpt(TA0IV + TA0IV, 0, TA0CCR1))  // each read resets the highest pending interrupt flag
-	  __bic_SR_register_on_exit(LPM0_bits); // Exit LPM0
-}
-
-#pragma vector=TIMER1_A1_VECTOR
-__interrupt void TIMER1_A1_ISR_HOOK(void) {
-	if (oscIntrpt(TA1IV + TA1IV, 1, TA1CCR1))  // each read resets the highest pending interrupt flag
-	  __bic_SR_register_on_exit(LPM0_bits); // Exit LPM0
-}
-
-
-#pragma vector=TIMER2_A1_VECTOR
-__interrupt void TIMER2_A1_ISR_HOOK(void) {
-	if (oscIntrpt(TA2IV + TA2IV, 2, TA2CCR1))  // each read resets the highest pending interrupt flag
-	  __bic_SR_register_on_exit(LPM0_bits); // Exit LPM0
+	send('.'); // missed 1PPS
 }
 
 #pragma vector=TIMER0_B1_VECTOR
 __interrupt void TIMER0_B1_ISR_HOOK(void) {
-  if (oscIntrpt(TB0IV + TB0IV, 3, TB0CCR1)) // each read resets the highest pending interrupt flag
+  if (oscIntrpt(TB0IV + TB0IV, 0, TB0CCR1)) // each read resets the highest pending interrupt flag
 	  __bic_SR_register_on_exit(LPM0_bits); // Exit LPM0
 }
 
 
-void init1PPS() {
-  P1SEL = OnePPSA0 | XtalA1;
-  P2SEL = OnePPSA1 | XtalA2 | OnePPSA2;
-  P4SEL = XtalB | OnePPSB;
+#pragma vector=TIMER0_A1_VECTOR
+__interrupt void TIMER0_A1_ISR_HOOK(void) {
+	if (oscIntrpt(TA0IV + TA0IV, 1, TA0CCR1))
+		__bic_SR_register_on_exit(LPM0_bits);
+}
 
-  TA1CTL = TA2CTL = TB0CTL = TASSEL_0 | MC_2 | TACLR | TAIE; // TxxCLK pin
+#pragma vector=TIMER1_A1_VECTOR
+__interrupt void TIMER1_A1_ISR_HOOK(void) {
+	if (oscIntrpt(TA1IV + TA1IV, 2, TA1CCR1))
+		__bic_SR_register_on_exit(LPM0_bits);
+}
+
+
+#pragma vector=TIMER2_A1_VECTOR
+__interrupt void TIMER2_A1_ISR_HOOK(void) { // socketed xtal
+	if (oscIntrpt(TA2IV + TA2IV, 3, TA2CCR1))
+	  __bic_SR_register_on_exit(LPM0_bits);
+}
+
+
+void init1PPS() {
+  P1SEL = XtalA0 | OnePPSA0 | XtalA1;
+  P2SEL = OnePPSA1 | XtalA2 | OnePPSA2;
+  P4SEL = OnePPSB;
+
+  TA0CTL = TA1CTL = TA2CTL = TASSEL_0 | MC_2 | TACLR | TAIE; // TxxCLK pin
   TA0CCTL1 = TA1CCTL1 = TA2CCTL1 = TB0CCTL1 = CM_1 | SCS | CAP | CCIE; // PPS rising edge
 
-  TA0CTL = TASSEL_1 | MC_2 | TACLR | TAIE; // ACLK
-  TA0CCR0 = TA0R + PPS_WDT_Ticks;
-  TA0CCTL0 = CCIE;  // 1PPS watchdog
+  TB0CTL = TASSEL_1 | MC_2 | TACLR | TAIE; // ACLK
+  TB0CCR0 = TA0R + PPS_WDT_Ticks;
+  TB0CCTL0 = CCIE;  // 1PPS watchdog
 }
 
 
@@ -628,7 +630,7 @@ void main() {
 	UCA0IE |= UCRXIE;
 
   init1PPS();
-  initADC();
+  // initADC();
 
   __bis_SR_register(GIE);
 
