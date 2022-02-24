@@ -105,20 +105,6 @@ void sendHex(ulong i, int width = 0) {
   send(p);
 }
 
-void sendHex(ullong i, int width = 0) {
-  char intStr[16+1];
-  char* p = intStr + sizeof(intStr) - 1; // at end
-  *p = 0;
-  do {
-    uint n = i & 0xF;
-    *--p = n <= 9 ? n + '0' : n + 'A' - 10;
-  	i >>= 4;
-    --width;
-  } while (i || width > 0);
-  send(p);
-}
-
-
 ulong bin2BCD(ulong bin) { // double dabble
   if (!bin) return 0;
   if (bin > 99999999)
@@ -147,6 +133,20 @@ void sendDec(long i, const char* tag = ", ", int width = 0) { // 8 digits max
 	send(tag);
 }
 
+#if 0
+
+void sendHex(ullong i, int width = 0) {
+  char intStr[16+1];
+  char* p = intStr + sizeof(intStr) - 1; // at end
+  *p = 0;
+  do {
+    uint n = i & 0xF;
+    *--p = n <= 9 ? n + '0' : n + 'A' - 10;
+  	i >>= 4;
+    --width;
+  } while (i || width > 0);
+  send(p);
+}
 
 ullong bin2BCD(ullong bin) { // double dabble
   if (!bin) return 0;
@@ -171,6 +171,7 @@ void sendDec(ullong i, const char* tag = ", ", int width = 0) { // 8 digits max
 	sendHex(bin2BCD(i), width);
 	send(tag);
 }
+#endif
 
 
 void initPins() {
@@ -224,6 +225,16 @@ void stableDCO() {
 
 
 void initClocks() {
+	uint year = RTCYEAR, date = RTCDATE, hour = RTCTIM1, minSec = RTCTIM0;  // save time
+
+	RTCCTL01 = RTCBCD | RTCMODE; // BCD from ACLK, resets time
+
+	// restore time
+  RTCYEAR = year;
+	RTCDATE = date;
+	RTCTIM1 = hour;
+	RTCTIM0 = minSec;
+
 	UCSCTL4 = SELA_2 | SELS_3 | SELM_2;  // ACLK = REFOCLK; SMCLK from DCO to enable DCO;  MCLK = REFOCLK while stabilizing DCO;
 	UCSCTL6 = XT2OFF | XT1DRIVE_3 | XCAP_3; // start XT1 w/ 12 pF load
 
@@ -274,7 +285,8 @@ int compileLater;
 
 void useLatest(volatile uchar& rtc, char* compile) {
 	uchar compileBCD = (compile[0] & 0xF) << 4 | compile[1] & 0xF;
-	if (!compileLater) compileLater = compileBCD - rtc;
+	if (!compileLater)
+		compileLater = (int)compileBCD - (char)rtc;
 	if (compileLater > 0)
 		rtc = compileBCD;
 }
@@ -305,7 +317,13 @@ void initRTC() {
   // PPM = (f / 2064384 - 1) * 1000000
   const int OscErrPPM = -9; // negative = xtal too slow
 	const signed char slowDown = OscErrPPM / (OscErrPPM > 0 ? 2 : 4); // steps: -2.035 ppm; +4.069 ppm
-	RTCCTL23 = RTCCALF_1 | slowDown; // 512 Hz out to RTCCLK, pin 32
+	RTCCTL23 = slowDown;
+}
+
+void sendTime(const char* sep = ", ", bool date = false) {
+	if (date) {sendHex(RTCMON);  send('/'); sendHex(RTCDAY); send('/'); sendHex(RTCYEARL); send(' ');}
+	if (RTCHOUR < 10) send('0');
+	sendHex(RTCHOUR); send(':'); sendHex(RTCMIN, 2); send(':'); sendHex(RTCSEC,2); send(sep);
 }
 
 
@@ -360,7 +378,7 @@ long NomHz[NumOsc];
 
 volatile llong xtalTicks[NumOsc];
 volatile long secs[NumOsc] = {-1, -1, -1, -1};
-volatile int edgeReady;
+volatile int ppsEdge;
 
 bool oscIntrpt(int TIVs, int oscIdx, uint TCCR1) {  // returns sample ready
 	static llong ovflCount[NumOsc];
@@ -395,9 +413,8 @@ bool oscIntrpt(int TIVs, int oscIdx, uint TCCR1) {  // returns sample ready
 
 	if (secs[oscIdx] > 0) {
 		int ppsWindow = (TA2CCR0 - TA2R + 8) & 0x7FFF;
-		if (ppsWindow > 16) { // filter excess 1PPS edges
-			sendDec((long)ppsWindow);
-			send('x'); // 1PPS glitch
+		if (ppsWindow > 16) { // filter excess 1PPS edges -- TOD: glitch close to 1PPS still trouble: p(1/2000)
+			// sendHex((long)ppsWindow, "xtra\n");
 			return false;
 		}
 	}
@@ -407,7 +424,7 @@ bool oscIntrpt(int TIVs, int oscIdx, uint TCCR1) {  // returns sample ready
 		xtalTicks[oscIdx] = counts[oscIdx].llongv - initial[oscIdx];
 	} else 	initial[oscIdx] = counts[oscIdx].llongv;
 
-	edgeReady |= 1 << oscIdx;
+	ppsEdge |= 1 << oscIdx;
 	return true;
 }
 
@@ -429,7 +446,7 @@ __interrupt void TIMER2_A0_ISR_HOOK(void) {  // 1PPS watchdog
   TA2CCR0 = TA2R + PPS_WDT_Ticks;  // next watchdog
 	for (uint osc = 0; osc < NumOsc; ++osc)
 		++secs[osc];
-	send('.'); // missed 1PPS
+	// send('.'); // missed 1PPS
 }
 
 #pragma vector=TIMER2_A1_VECTOR
@@ -528,11 +545,15 @@ void reportMHz() {
 		if (NomHz[osc] <= 0)
 			newXtal |= setNomHz(osc);
 	}
-	if (newXtal) send(" xtal Hz\n");
+	if (newXtal) send("Hz\n");
+
+	sendTime();
 
 	for (uint osc = 0; osc < NumOsc; ++osc) {
 		const long resolution = 1000000000; // PPB
-		//TODO: first PPM error report differs from others
+		// First few PPM error reports differ from later:
+		//  32KHz: truncation: 1 count = 30 ppm / 2s = 15 ppm
+		//  others: short-term frequency instability?, Vcc dip?
 		long ppRes = (xtalTicks[osc] - (llong)NomHz[osc] * secs[osc]) * resolution / secs[osc] / NomHz[osc];
 	  sendDec((long)(ppRes / (resolution / 1000000)), "."); // PPM
 	  sendDec((long)(abs(ppRes) % (resolution / 1000000)), ", ", 3);  // digits beyond PPM decimal
@@ -553,11 +574,11 @@ void chk1PPS() {
     } else reportSecs <<= 1;
 	}
 
-  if (!(edgeReady & 8)) {  // xtal out of socket
+  if (!(ppsEdge & 1 << 3)) { // check ZIF xtal
 		secs[3] = -1;
 		NomHz[3] = 0;
   }
-	edgeReady = 0;  // or one at a time
+	ppsEdge = 0;  // or one at a time
 }
 
 
@@ -576,7 +597,9 @@ void chkSerCmd() {
 		case ' ':
 		case 'R' : reportMHz(); break;
 		case 'T' : send(",,"); sendTemp(); break;
-		case 'Z' :
+		case 'Z':
+			secs[0] = secs[1] = secs[2] = secs[3] = -1;
+		case 'X' :
 			NomHz[3] = 0;
 			secs[3] = -1;
 			reportSecs = 2;
@@ -590,6 +613,7 @@ void main() {
 
   initPins();
 	initClocks();
+	initRTC();
 
   identify();
 
