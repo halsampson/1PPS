@@ -26,15 +26,13 @@ const ulong CPUHz = 4 * (8 * BaudRate);  // 8 * 921600 = 225 * 32768
 const ulong XtalHz = 32768L;
 
 // P1 pins
-#define TenMHz BIT0  // TA0CLK   // pin 18
-#define OnePPS BIT2  // CCI1A    // pin 20
-
-#define TenMHz1 BIT6  // TA1CLK  // pin 24
+#define OnePPSA0 BIT2  // CCI0A   // pin 20
+#define XtalA1   BIT6  // TA1CLK  // pin 24
 
 // P2 pins
-#define OnePPS1 BIT0  // CCI1A   // pin 26
-#define OnePPS2 BIT4  // CCI2A   // pin 30
-
+#define OnePPSA1 BIT0  // CCI1A   // pin 26
+#define XtalA2   BIT2  // TA2CLK  // pin 28
+#define OnePPSA2 BIT4  // CCI2A   // pin 30
 
 // P3 pins:
 #define TxD			BIT3  // pin 37
@@ -371,7 +369,7 @@ void sendTemp() {
   sendDec((long)temp100ths, "\n");
 }
 
-const uint PPS_WDT_Ticks = 32768;  // interrupt processing takes ~7 ticks
+const uint PPS_WDT_Ticks = 32768 + 2;
 
 const int NumOsc = 4;
 long NomHz[NumOsc];
@@ -380,7 +378,9 @@ volatile llong xtalTicks[NumOsc];
 volatile long secs[NumOsc] = {-1, -1, -1, -1};
 volatile int ppsEdge;
 
-bool oscIntrpt(int TIVs, int oscIdx, uint TCCR1) {  // returns sample ready
+volatile bool missed1PPS;
+
+bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
 	static llong ovflCount[NumOsc];
 	static llong initial[NumOsc];
 	static union {
@@ -408,17 +408,21 @@ bool oscIntrpt(int TIVs, int oscIdx, uint TCCR1) {  // returns sample ready
 			break;
 	}
 
-  // sample ready:
-	counts[oscIdx].LSW = TCCR1;
-
-	if (secs[oscIdx] > 0) {
-		int ppsWindow = (TA2CCR0 - TA2R + 8) & 0x7FFF;
-		if (ppsWindow > 16) { // filter excess 1PPS edges -- TOD: glitch close to 1PPS still trouble: p(1/2000)
-			// sendHex((long)ppsWindow, "xtra\n");
-			return false;
+  // 1 PPS edge:
+  static bool onePPSglitch;
+	if (oscIdx == 0)  {// first serviced
+	  uint residual = TA0CCR0 - TA0R;
+	  // TODO: residual will increase on each missing pulse
+		if (secs[0] > 0 && !missed1PPS && (onePPSglitch = residual > 4)) {
+			sendHex(residual);
+			return;
 		}
+		TA0CCR0 = TA0R + PPS_WDT_Ticks;
+		missed1PPS = false;
 	}
-	TA2CCR0 = TA2R + PPS_WDT_Ticks;  // last serviced will be ~7 ticks late
+	if (onePPSglitch) return;
+
+	counts[oscIdx].LSW = TCCR1;
 
 	if (++secs[oscIdx] > 0) {
 		xtalTicks[oscIdx] = counts[oscIdx].llongv - initial[oscIdx];
@@ -428,6 +432,15 @@ bool oscIntrpt(int TIVs, int oscIdx, uint TCCR1) {  // returns sample ready
 	return true;
 }
 
+
+#pragma vector=TIMER0_A0_VECTOR
+__interrupt void TIMER0_A0_ISR_HOOK(void) {  // 1PPS watchdog
+  TA0CCR0 = TA0R + PPS_WDT_Ticks;  // next watchdog to keep rough time
+	for (uint osc = 0; osc < NumOsc; ++osc)
+		++secs[osc];
+	missed1PPS = true;
+	// send('.'); // missed 1PPS
+}
 
 #pragma vector=TIMER0_A1_VECTOR
 __interrupt void TIMER0_A1_ISR_HOOK(void) {
@@ -441,16 +454,9 @@ __interrupt void TIMER1_A1_ISR_HOOK(void) {
 	  __bic_SR_register_on_exit(LPM0_bits); // Exit LPM0
 }
 
-#pragma vector=TIMER2_A0_VECTOR
-__interrupt void TIMER2_A0_ISR_HOOK(void) {  // 1PPS watchdog
-  TA2CCR0 = TA2R + PPS_WDT_Ticks;  // next watchdog
-	for (uint osc = 0; osc < NumOsc; ++osc)
-		++secs[osc];
-	// send('.'); // missed 1PPS
-}
 
 #pragma vector=TIMER2_A1_VECTOR
-__interrupt void TIMER2_A1_ISR_HOOK(void) {  // 32KHz
+__interrupt void TIMER2_A1_ISR_HOOK(void) {
 	if (oscIntrpt(TA2IV + TA2IV, 2, TA2CCR1))  // each read resets the highest pending interrupt flag
 	  __bic_SR_register_on_exit(LPM0_bits); // Exit LPM0
 }
@@ -463,16 +469,16 @@ __interrupt void TIMER0_B1_ISR_HOOK(void) {
 
 
 void init1PPS() {
-  P1SEL = TenMHz | OnePPS | TenMHz1;
-  P2SEL = OnePPS1 | OnePPS2;
+  P1SEL = OnePPSA0 | XtalA1;
+  P2SEL = OnePPSA1 | XtalA2 | OnePPSA2;
   P4SEL = XtalB | OnePPSB;
 
-  TA0CTL = TA1CTL = TB0CTL = TASSEL_0 | MC_2 | TACLR | TAIE; // TxxCLK pin
-  TA2CTL = TASSEL_1 | MC_2 | TACLR | TAIE; // ACLK
-  TA0CCTL1 = TA1CCTL1 = TA2CCTL1 = TB0CCTL1 = CM_1 | SCS | CAP | CCIE; // rising edge
+  TA1CTL = TA2CTL = TB0CTL = TASSEL_0 | MC_2 | TACLR | TAIE; // TxxCLK pin
+  TA0CCTL1 = TA1CCTL1 = TA2CCTL1 = TB0CCTL1 = CM_1 | SCS | CAP | CCIE; // PPS rising edge
 
-  TA2CCR0 = TA2R + PPS_WDT_Ticks;
-  TA2CCTL0 = CCIE;  // 1PPS watchdog
+  TA0CTL = TASSEL_1 | MC_2 | TACLR | TAIE; // ACLK
+  TA0CCR0 = TA0R + PPS_WDT_Ticks;
+  TA0CCTL0 = CCIE;  // 1PPS watchdog
 }
 
 
@@ -566,9 +572,11 @@ long reportSecs = 2;
 const uint measSecs = 1000;  // 17 minutes
 
 void chk1PPS() {
-	if (secs[2] > 0 && !(secs[2] % reportSecs) || secs[2] >= measSecs) {
+	if (secs[0] <= 1) return;
+
+	if (!(secs[0] % reportSecs) || secs[0] >= measSecs) {
     reportMHz();
-    if (secs[2] >= measSecs) {
+    if (secs[0] >= measSecs) {
        secs[0] = secs[1] = secs[2] = secs[3] = -1; // new measurements
        reportSecs = measSecs;
     } else reportSecs <<= 1;
