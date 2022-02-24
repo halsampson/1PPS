@@ -330,7 +330,8 @@ void initADC(){
 	REFCTL0 = REFMSTR | REFOUT | REFON;  // 1.5V
 
 	// (256 + 13) / 1.8432 MHz = 146 us ~ 6852 samples/sec
-	ADC12CTL0 = ADC12SHT0_8 | ADC12MSC | ADC12ON;  // > 100 us temperature sensor settle
+	// (1024 + 13) / 1.8432 MHz = 563 us ~ 1777 samples/sec
+	ADC12CTL0 = ADC12SHT0_15 | ADC12MSC | ADC12ON;  // > 100 us temperature sensor settle
 	ADC12CTL1 = ADC12SHP | ADC12DIV_7 | ADC12SSEL_3 | ADC12CONSEQ_2;  // want 1 to 2.4 MHz; SMCLK / 8 = 1.8432 MHz
 	ADC12CTL2 = ADC12RES_2;  // 12 bit conversion
 
@@ -343,12 +344,6 @@ void initADC(){
 
 volatile llong iTempADC;
 volatile llong iSamples;
-
-#pragma vector=ADC12_VECTOR
-__interrupt void ADC12_HOOK() {
-	iTempADC += ADC12MEM0;
-	++iSamples;
-}
 
 void sendTemp() {
 	llong tempADC;
@@ -368,28 +363,29 @@ void sendTemp() {
   sendDec((long)temp100ths, "\n");
 }
 
-const uint watchdogMargin = 2;
+
+const uint watchdogMargin = 1;  // TB0CCR0 interrupt jitter between setting/checking TB0CCR0
 const uint PPS_WDT_Ticks = 32768 + watchdogMargin;
 
 const int NumOsc = 4;
 long NomHz[NumOsc];
 
-volatile llong xtalTicks[NumOsc];
 volatile long secs[NumOsc] = {-1, -1, -1, -1};
 volatile int ppsEdge;
 
 volatile bool missed1PPS;
 
+volatile llong initial[NumOsc];
+volatile union {
+	llong llongv;
+  struct {
+    uint LSW;
+    llong MSW;
+  };
+} counts[NumOsc];
+
 bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
 	static llong ovflCount[NumOsc];
-	static llong initial[NumOsc];
-	static union {
-		llong llongv;
-	  struct {
-	    uint LSW;
-	    llong MSW;
-	  };
-	} counts[NumOsc];
 
   switch (TIVs) { // each read resets the highest pending interrupt flag
 		case 0xE : // overflow only - lowest priority -> can interrupt before/after edge capture
@@ -408,25 +404,24 @@ bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
 			break;
 	}
 
-  // 1 PPS edge:
+  // 1 PPS edge
+
   static bool onePPSglitch;
 	if (oscIdx == 0)  {// first serviced = TB0
 	  uint residual = TB0CCR0 - TB0R; // watchdog time left: should be near watchdogMargin
 	  // residual increases on each missing pulse
 		if (secs[0] > 0 && !missed1PPS && (onePPSglitch = residual > watchdogMargin + 1)) {
 			sendHex(residual);
-			return;
+			return false;
 		}
 		TB0CCR0 = TB0R + PPS_WDT_Ticks;
 		missed1PPS = false;
 	}
-	if (onePPSglitch) return;
+	if (onePPSglitch) return false;
 
 	counts[oscIdx].LSW = TCCR1;
-
-	if (++secs[oscIdx] > 0) {
-		xtalTicks[oscIdx] = counts[oscIdx].llongv - initial[oscIdx];
-	} else 	initial[oscIdx] = counts[oscIdx].llongv;
+	if (++secs[oscIdx] <= 0)
+	 	initial[oscIdx] = counts[oscIdx].llongv;
 
 	ppsEdge |= 1 << oscIdx;
 	return true;
@@ -449,6 +444,12 @@ __interrupt void TIMER0_B1_ISR_HOOK(void) {
 	  __bic_SR_register_on_exit(LPM0_bits); // Exit LPM0
 }
 
+#pragma vector=ADC12_VECTOR
+__interrupt void ADC12_HOOK() {
+	// __bis_SR_register(GIE);  // allow other interrupts -> re-enters !!
+	iTempADC += ADC12MEM0;
+	++iSamples;
+}
 
 #pragma vector=TIMER0_A1_VECTOR
 __interrupt void TIMER0_A1_ISR_HOOK(void) {
@@ -461,7 +462,6 @@ __interrupt void TIMER1_A1_ISR_HOOK(void) {
 	if (oscIntrpt(TA1IV + TA1IV, 2, TA1CCR1))
 		__bic_SR_register_on_exit(LPM0_bits);
 }
-
 
 #pragma vector=TIMER2_A1_VECTOR
 __interrupt void TIMER2_A1_ISR_HOOK(void) { // socketed xtal
@@ -482,7 +482,6 @@ void init1PPS() {
   TB0CCR0 = TA0R + PPS_WDT_Ticks;
   TB0CCTL0 = CCIE;  // 1PPS watchdog
 }
-
 
 bool setNomHz(int osc) {
 	const long xtalHz[] = {32768,
@@ -512,7 +511,7 @@ bool setNomHz(int osc) {
 	const int K1100tol = 10000; // 1 / 0.01%
 	const int K1114tol = 2000;  // 1 / 0.05%
 
-	long Hz = xtalTicks[osc] / secs[osc];  // measured
+	long Hz = (counts[osc].llongv - initial[osc]) / secs[osc];  // measured
 
 	int f = 0;
 	if (labs(Hz - (Hz + 50000) / 100000 * 100000) <= Hz / K1100tol)   // within 1kHz of N * 100kHz
@@ -562,7 +561,7 @@ void reportMHz() {
 		// First few PPM error reports differ from later:
 		//  32KHz: truncation: 1 count = 30 ppm / 2s = 15 ppm
 		//  others: short-term frequency instability?, Vcc dip?
-		long ppRes = (xtalTicks[osc] - (llong)NomHz[osc] * secs[osc]) * resolution / secs[osc] / NomHz[osc];
+		long ppRes = ((counts[osc].llongv - initial[osc]) - (llong)NomHz[osc] * secs[osc]) * resolution / secs[osc] / NomHz[osc];
 	  sendDec((long)(ppRes / (resolution / 1000000)), "."); // PPM
 	  sendDec((long)(abs(ppRes) % (resolution / 1000000)), ", ", 3);  // digits beyond PPM decimal
 	}
@@ -630,7 +629,7 @@ void main() {
 	UCA0IE |= UCRXIE;
 
   init1PPS();
-  // initADC();
+  initADC();  // for temperature
 
   __bis_SR_register(GIE);
 
