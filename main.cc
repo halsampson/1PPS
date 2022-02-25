@@ -337,17 +337,16 @@ void initADC(){
 
 	ADC12MCTL0 = ADC12EOS | ADC12SREF_1 | ADC12INCH_10;  // temperature
 
-	ADC12IE = ADC12IE0;
 	ADC12CTL0 |= ADC12ENC | ADC12SC;
 }
 
 
-volatile llong iTempADC;
-volatile llong iSamples;
+volatile long iTempADC;
+volatile int  iSamples;
 
 void sendTemp() {
-	llong tempADC;
-	llong samples;
+	long tempADC;
+  int samples;
 	__bic_SR_register(GIE);
 	tempADC = iTempADC;
 	samples = iSamples;
@@ -358,7 +357,7 @@ void sendTemp() {
   static uint CAL_ADC_T30_1V5 = *(uint*)0x1A1A;
   static uint CAL_ADC_T85_1V5 = *(uint*)0x1A1C;
   static uint CAL_DELTA_55 = CAL_ADC_T85_1V5 - CAL_ADC_T30_1V5;
-  int temp100ths = (tempADC - CAL_ADC_T30_1V5 * samples) * (85 - 30) * 100 / CAL_DELTA_55 / samples + 30 * 100;
+  int temp100ths = (tempADC - (long)CAL_ADC_T30_1V5 * samples) * (85 - 30) * 100 / CAL_DELTA_55 / samples + 30 * 100;
 
   sendDec((long)temp100ths, "\n");
 }
@@ -384,8 +383,31 @@ volatile union {
   };
 } counts[NumOsc];
 
+
+// 55 MHz off by 65536 in 1000 secs = 1.19 PPM (but see same PPM variation at 2 minutes! so xtal variation?)
+// could move 55 MHz to TB0
+
 bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
 	static llong ovflCount[NumOsc];
+
+  static bool onePPSglitch;
+	if (oscIdx == 0)  {// first serviced = TB0 = 32 KHz (or 55MHz if still lose edges)
+		if (TIVs != 0xE) {  // 1 PPS edge
+			uint residual = TB0CCR0 - TB0R; // watchdog time left: should be near watchdogMargin
+			// residual increases on each missing pulse
+			if (secs[0] > 0 && !missed1PPS && (onePPSglitch = residual > watchdogMargin + 1)) {
+				// sendHex(residual);
+				return false;
+			}
+			TB0CCR0 = TB0R + PPS_WDT_Ticks;
+			missed1PPS = false;
+		}
+		__bis_SR_register(GIE);  // allow other interrupts - 32KHz has lots of time to service
+
+		iTempADC += ADC12MEM0;
+		++iSamples;
+	}
+	if (onePPSglitch) return false;
 
   switch (TIVs) { // each read resets the highest pending interrupt flag
 		case 0xE : // overflow only - lowest priority -> can interrupt before/after edge capture
@@ -406,19 +428,6 @@ bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
 
   // 1 PPS edge
 
-  static bool onePPSglitch;
-	if (oscIdx == 0)  {// first serviced = TB0
-	  uint residual = TB0CCR0 - TB0R; // watchdog time left: should be near watchdogMargin
-	  // residual increases on each missing pulse
-		if (secs[0] > 0 && !missed1PPS && (onePPSglitch = residual > watchdogMargin + 1)) {
-			sendHex(residual);
-			return false;
-		}
-		TB0CCR0 = TB0R + PPS_WDT_Ticks;
-		missed1PPS = false;
-	}
-	if (onePPSglitch) return false;
-
 	counts[oscIdx].LSW = TCCR1;
 	if (++secs[oscIdx] <= 0)
 	 	initial[oscIdx] = counts[oscIdx].llongv;
@@ -435,20 +444,13 @@ __interrupt void TIMER0_B0_ISR_HOOK(void) {  // 1PPS watchdog
 	for (uint osc = 0; osc < NumOsc; ++osc)
 		++secs[osc];
 	missed1PPS = true;
-	send('.'); // missed 1PPS
+	//send('.'); // missed 1PPS
 }
 
 #pragma vector=TIMER0_B1_VECTOR
 __interrupt void TIMER0_B1_ISR_HOOK(void) {
   if (oscIntrpt(TB0IV + TB0IV, 0, TB0CCR1)) // each read resets the highest pending interrupt flag
 	  __bic_SR_register_on_exit(LPM0_bits); // Exit LPM0
-}
-
-#pragma vector=ADC12_VECTOR
-__interrupt void ADC12_HOOK() {
-	// __bis_SR_register(GIE);  // allow other interrupts -> re-enters !!
-	iTempADC += ADC12MEM0;
-	++iSamples;
 }
 
 #pragma vector=TIMER0_A1_VECTOR
