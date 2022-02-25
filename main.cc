@@ -2,9 +2,6 @@
 
 // Check oscillators Hz using GPS 1 PPS
 
-// 10000013.238, 9999979.297, 32767.719, 29.24C
-// 10000013.244, 9999979.486, 32767.719, 30.00
-
 // 1PPS has extra pulses and missing pulses
 
 // TTL oscillator signals OK (3.6V Voh drive)
@@ -21,9 +18,9 @@ typedef long long llong;
 
 #define min(a,b) ((a) < (b) ? (a) : (b))
 
-const ulong BaudRate  = 921600L;
+const ulong BaudRate  = 921600;
 const ulong CPUHz = 4 * (8 * BaudRate);  // 8 * 921600 = 225 * 32768
-const ulong XtalHz = 32768L;
+const ulong XtalHz = 32768;
 
 // P1 pins
 #define XtalA0   BIT0  // TA1CLK  // pin 18
@@ -387,10 +384,11 @@ volatile union {
 // 55 MHz off by 65536 in 1000 secs = 1.19 PPM (but see same PPM variation at 2 minutes! so xtal variation?)
 // could move 55 MHz to TB0
 
+volatile bool onePPSglitch;
+
 bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
 	static llong ovflCount[NumOsc];
 
-  static bool onePPSglitch;
 	if (oscIdx == 0)  {// first serviced = TB0 = 32 KHz (or 55MHz if still lose edges)
 		if (TIVs != 0xE) {  // 1 PPS edge
 			uint residual = TB0CCR0 - TB0R; // watchdog time left: should be near watchdogMargin
@@ -585,7 +583,7 @@ void chk1PPS() {
     } else reportSecs <<= 1;
 	}
 
-  if (!(ppsEdge & 1 << 3)) { // check ZIF xtal
+  if (!onePPSglitch && !missed1PPS && ppsEdge == 7) { // all but ZIF xtal clock
 		secs[3] = -1;
 		NomHz[3] = 0;
   }
