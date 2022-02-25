@@ -372,8 +372,10 @@ volatile int ppsEdge;
 volatile bool missed1PPS;
 
 volatile llong initial[NumOsc];
+
 volatile union {
 	llong llongv;
+	long longv;
   struct {
     uint LSW;
     llong MSW;
@@ -384,29 +386,16 @@ volatile union {
 // 55 MHz off by 65536 in 1000 secs = 1.19 PPM (but see same PPM variation at 2 minutes! so xtal variation?)
 // could move 55 MHz to TB0
 
-volatile bool onePPSglitch;
-
 bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
-	static llong ovflCount[NumOsc];
-
-	if (oscIdx == 0)  {// first serviced = TB0 = 32 KHz (or 55MHz if still lose edges)
-		if (TIVs != 0xE) {  // 1 PPS edge
-			uint residual = TB0CCR0 - TB0R; // watchdog time left: should be near watchdogMargin
-			// residual increases on each missing pulse
-			if (secs[0] > 0 && !missed1PPS && (onePPSglitch = residual > watchdogMargin + 1)) {
-				// sendHex(residual);
-				return false;
-			}
-			TB0CCR0 = TB0R + PPS_WDT_Ticks;
-			missed1PPS = false;
-		}
-		__bis_SR_register(GIE);  // allow other interrupts - 32KHz has lots of time to service
+	if (oscIdx == 0 && TIVs != 0xE) {
+	  TB0CCR0 = TB0R + PPS_WDT_Ticks; // reset watchdog for missing 1PPS pulses
+	  __bis_SR_register(GIE);  // allow other interrupts - 32KHz has lots of time to service
 
 		iTempADC += ADC12MEM0;
 		++iSamples;
 	}
-	if (onePPSglitch) return false;
 
+	static llong ovflCount[NumOsc];
   switch (TIVs) { // each read resets the highest pending interrupt flag
 		case 0xE : // overflow only - lowest priority -> can interrupt before/after edge capture
 		  ++ovflCount[oscIdx];
@@ -438,10 +427,9 @@ bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
 
 #pragma vector=TIMER0_B0_VECTOR
 __interrupt void TIMER0_B0_ISR_HOOK(void) {  // 1PPS watchdog
-  TB0CCR0 = TB0R + PPS_WDT_Ticks;  // next watchdog to keep rough time
+  TB0CCR0 = TB0R + PPS_WDT_Ticks;  // next watchdog to keep rough time when no satellites in view
 	for (uint osc = 0; osc < NumOsc; ++osc)
 		++secs[osc];
-	missed1PPS = true;
 	//send('.'); // missed 1PPS
 }
 
@@ -479,7 +467,7 @@ void init1PPS() {
   TA0CCTL1 = TA1CCTL1 = TA2CCTL1 = TB0CCTL1 = CM_1 | SCS | CAP | CCIE; // PPS rising edge
 
   TB0CTL = TASSEL_1 | MC_2 | TACLR | TAIE; // ACLK
-  TB0CCR0 = TA0R + PPS_WDT_Ticks;
+  TB0CCR0 = TB0R + PPS_WDT_Ticks;
   TB0CCTL0 = CCIE;  // 1PPS watchdog
 }
 
@@ -529,7 +517,7 @@ bool setNomHz(int osc) {
 		if (!xtalHz[f]) { // non-standard Hz
 			static long lastNonStdHz;
 			if (Hz > 1000000 && labs(Hz - lastNonStdHz) < Hz / K1100tol) // only if stable after socket startup
-				 sendDec(Hz, " non-std!, ");
+				 send("Non-std:");
 			else {
 				lastNonStdHz = Hz;
 				NomHz[osc] = 0;
@@ -539,7 +527,7 @@ bool setNomHz(int osc) {
 		}
 	}
 
-	sendDec(NomHz[osc] = Hz);
+	NomHz[osc] = Hz;
 	return true;
 }
 
@@ -547,23 +535,36 @@ bool setNomHz(int osc) {
 void reportMHz() {
 	bool newXtal = false;
 	for (uint osc = 0; osc < NumOsc; ++osc) {
-		if (secs[osc] <= 0)
-			return;
-		if (NomHz[osc] <= 0)
-			newXtal |= setNomHz(osc);
+		if (NomHz[osc] <= 0) {
+			bool setNom = setNomHz(osc);
+			if (setNom && !newXtal)
+				sendTime();
+			if (setNom) {
+			  newXtal = true;
+			  if (!(NomHz[osc] % 1000000))
+			  	sendDec(NomHz[osc] / 1000000, " MHz, ");
+			  else if (!(NomHz[osc] % 1000))
+			  	sendDec(NomHz[osc] / 1000, " kHz, ");
+			  else sendDec(NomHz[osc]);
+			}
+		}
 	}
-	if (newXtal) send("Hz\n");
+	if (newXtal) send('\n');
 
 	sendTime();
-
 	for (uint osc = 0; osc < NumOsc; ++osc) {
-		const long resolution = 1000000000; // PPB
 		// First few PPM error reports differ from later:
 		//  32KHz: truncation: 1 count = 30 ppm / 2s = 15 ppm
 		//  others: short-term frequency instability?, Vcc dip?
-		long ppRes = ((counts[osc].llongv - initial[osc]) - (llong)NomHz[osc] * secs[osc]) * resolution / secs[osc] / NomHz[osc];
-	  sendDec((long)(ppRes / (resolution / 1000000)), "."); // PPM
-	  sendDec((long)(abs(ppRes) % (resolution / 1000000)), ", ", 3);  // digits beyond PPM decimal
+
+		llong xtalCounts = counts[osc].llongv - initial[osc];
+		int locSecs = (xtalCounts + NomHz[osc] / 2) / NomHz[osc];
+		if (locSecs) {
+			const long resolution = 1000000000; // PPB
+		  long ppRes = (xtalCounts - (llong)NomHz[osc] * locSecs) * resolution / locSecs / NomHz[osc];
+	    sendDec((long)(ppRes / (resolution / 1000000)), "."); // PPM
+	    sendDec((long)(abs(ppRes) % (resolution / 1000000)), ", ", 3);  // digits beyond PPM decimal
+		} else send("off, ");
 	}
 
   sendTemp();
@@ -583,7 +584,7 @@ void chk1PPS() {
     } else reportSecs <<= 1;
 	}
 
-  if (!onePPSglitch && !missed1PPS && ppsEdge == 7) { // all but ZIF xtal clock
+  if (ppsEdge == 7) { // all but ZIF xtal clock
 		secs[3] = -1;
 		NomHz[3] = 0;
   }
