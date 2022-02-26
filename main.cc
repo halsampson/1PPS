@@ -558,10 +558,10 @@ void reportMHz() {
 		//  others: short-term frequency instability?, Vcc dip?
 
 		llong xtalCounts = counts[osc].llongv - initial[osc];
-		int locSecs = (xtalCounts + NomHz[osc] / 2) / NomHz[osc];
-		if (locSecs) {
+		int nomSecs = (xtalCounts + NomHz[osc] / 2) / NomHz[osc];  // 10 PPM -> off after 14 hrs
+		if (nomSecs) {
 			const long resolution = 1000000000; // PPB
-		  long ppRes = (xtalCounts - (llong)NomHz[osc] * locSecs) * resolution / locSecs / NomHz[osc];
+		  long ppRes = (xtalCounts - (llong)NomHz[osc] * nomSecs) * resolution / nomSecs / NomHz[osc];
 	    sendDec((long)(ppRes / (resolution / 1000000)), "."); // PPM
 	    sendDec((long)(abs(ppRes) % (resolution / 1000000)), ", ", 3);  // digits beyond PPM decimal
 		} else send("off, ");
@@ -599,14 +599,51 @@ void chkSerCmd() {
 	if (++serOutPtr >= SerBufEnd)
 		serOutPtr = serBuf;
 
+	static bool enteringDigits;
+	static long param;
+	if (cmdChar >='0' && cmdChar <= '9') { // isnum
+	  if (!enteringDigits) {
+	  	enteringDigits = true;
+	  	param = 0;
+	  }
+	  param += param << 2; // * 5
+	  param <<= 1;         // * 2 -> * 10
+		param += cmdChar & 0xF;
+		return;
+	}
+  enteringDigits = false;
+
+	static bool negative;
 	if (cmdChar >= 'a') cmdChar &= 0x5F; // toUpper
 	switch (cmdChar) {
+		case '/' :
+		case ':' : return;  // ignore for date and time entry
+		case '-' : negative = true;	return;
+		case '+' : negative = false; return;
+
 		case '\r': send("\r\n"); break;
 		case 'I' : identify(); break;;
 		case 'F' : send("Ctrl-F8 to Free Run\n"); pause(); break;
 		case ' ':
 		case 'R' : reportMHz(); break;
-		case 'T' : send(",,"); sendTemp(); break;
+
+		case 'T' : // Time
+			if (param) { // set time
+				if (negative) {  // set date  [2022]1231
+					ulong dBCD = bin2BCD(-param);
+					if (dBCD & 0xFFFF0000)
+						RTCYEAR = dBCD >> 16;
+					RTCDATE = dBCD;
+				} else {
+ 				  ulong tBCD = bin2BCD(param); // 235959
+			  	RTCHOUR = tBCD >> 16;
+				  RTCTIM0 = tBCD; // Minutes:Secs
+				}
+			}
+			sendTime("\n", true);
+			param = 0;
+			break;
+
 		case 'Z':
 			secs[0] = secs[1] = secs[2] = secs[3] = -1;
 		case 'X' :
@@ -615,6 +652,7 @@ void chkSerCmd() {
 			reportSecs = 2;
 		  break;
 	}
+	negative = false;
 }
 
 
