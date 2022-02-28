@@ -464,6 +464,8 @@ void init1PPS() {
   // TB0CCTL0 = CCIE;  // 1PPS watchdog
 }
 
+long reportSecs = 2;
+
 bool setNomHz(int osc) {
 	const long xtalHz[] = {32768,
 		9830400, 10137600, 13824000, 18432000,// baud, some K1114
@@ -494,6 +496,8 @@ bool setNomHz(int osc) {
 
 	long Hz = (counts[osc].ullongv - initial[osc]) / secs[osc];  // measured
 
+	if (Hz < 10000) return false;
+
 	int f = 0;
 	if (labs(Hz - (Hz + 50000) / 100000 * 100000) <= Hz / K1100tol)   // within 1kHz of N * 100kHz
 		Hz = (Hz + 50000) / 100000 * 100000;
@@ -520,6 +524,7 @@ bool setNomHz(int osc) {
 		}
 	}
 
+	reportSecs = 2;
 	NomHz[osc] = Hz;
 	return true;
 }
@@ -563,7 +568,6 @@ void reportMHz() {
   send('\n');
 }
 
-long reportSecs = 2;
 const uint measSecs = 1000;  // 17 minutes
 
 void chk1PPS() {
