@@ -382,15 +382,11 @@ volatile union {
 } counts[NumOsc];
 
 
-// 55 MHz off by 65536 in 1000 secs = 1.19 PPM (but see same PPM variation at 2 minutes! so xtal variation?)
-// could move 55 MHz to TB0
+// TODO: socketed xtal occasionally misses an overflow count?
 
 bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
-	__bis_SR_register(GIE);  // allow other interrupts - correct TIVs on stack
-	// PPS interrupts will be ~simultaneous
-
 	static ulong ovflCount[NumOsc];
-  switch (TIVs) { // each read resets the highest pending interrupt flag
+  switch (TIVs) {
 		case 0xE : // overflow only - lowest priority -> can interrupt before/after edge capture
 		  ++ovflCount[oscIdx];
 		  return false;
@@ -399,7 +395,9 @@ bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
   		counts[oscIdx].MSW = ovflCount[oscIdx];
   		break;
 
-		case 2 + 0xE :   // near simultaneous edge and ovfl
+		case 2 + 0xE : // near simultaneous edge and ovfl
+		  // 4 simultaneous 1 PPS edge interrupts -> delayed service can get overflows
+		  // delay > 32768 xtalClocks -> lose an overflow    TODO: or less -- happens often
 		  if ((int)TCCR1 >= 0)  // edge occurred at/after overflow
 		  	counts[oscIdx].MSW = ++ovflCount[oscIdx];
 		  else
@@ -412,18 +410,13 @@ bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
 	if (++secs[oscIdx] <= 0)
 	 	initial[oscIdx] = counts[oscIdx].ullongv;
 
-	if (oscIdx == 0) {
-	  // TB0CCR0 = TB0R + PPS_WDT_Ticks; // reset watchdog for missing 1PPS pulses - not used
-		iTempADC += ADC12MEM0;
-		++iSamples;
-	}
-
 	ppsEdge |= 1 << oscIdx;
 	return true;
 }
 
 // interrupts from highest to lowest priority:
 
+#if 0
 #pragma vector=TIMER0_B0_VECTOR
 __interrupt void TIMER0_B0_ISR_HOOK(void) {  // 1PPS watchdog
   TB0CCR0 = TB0R + PPS_WDT_Ticks;  // next watchdog to keep rough time when no satellites in view
@@ -431,6 +424,7 @@ __interrupt void TIMER0_B0_ISR_HOOK(void) {  // 1PPS watchdog
 		++secs[osc];
 	//send('.'); // missed 1PPS
 }
+#endif
 
 #pragma vector=TIMER0_B1_VECTOR
 __interrupt void TIMER0_B1_ISR_HOOK(void) {
@@ -573,6 +567,9 @@ long reportSecs = 2;
 const uint measSecs = 1000;  // 17 minutes
 
 void chk1PPS() {
+	iTempADC += ADC12MEM0;
+	++iSamples;
+
 	if (secs[0] <= 1) return;
 
 	if (!(secs[0] % reportSecs) || secs[0] >= measSecs) {
