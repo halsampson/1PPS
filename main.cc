@@ -356,7 +356,7 @@ void sendTemp() {
   static uint CAL_DELTA_55 = CAL_ADC_T85_1V5 - CAL_ADC_T30_1V5;
   int temp100ths = (tempADC - (long)CAL_ADC_T30_1V5 * samples) * (85 - 30) * 100 / CAL_DELTA_55 / samples + 30 * 100;
 
-  sendDec((long)temp100ths, "\n");
+  sendDec(temp100ths/100, "."); sendDec(temp100ths % 100, ", ", 2);
 }
 
 
@@ -371,14 +371,13 @@ volatile int ppsEdge;
 
 volatile bool missed1PPS;
 
-volatile llong initial[NumOsc];
+volatile ullong initial[NumOsc];
 
 volatile union {
-	llong llongv;
-	long longv;
+	ullong ullongv;  // 48 bits incremented -- 1000 hrs of 55 MHz
   struct {
     uint LSW;
-    llong MSW;
+    ulong MSW;
   };
 } counts[NumOsc];
 
@@ -387,15 +386,10 @@ volatile union {
 // could move 55 MHz to TB0
 
 bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
-	if (oscIdx == 0 && TIVs != 0xE) {
-	  TB0CCR0 = TB0R + PPS_WDT_Ticks; // reset watchdog for missing 1PPS pulses
-	  __bis_SR_register(GIE);  // allow other interrupts - 32KHz has lots of time to service
+	__bis_SR_register(GIE);  // allow other interrupts - correct TIVs on stack
+	// PPS interrupts will be ~simultaneous
 
-		iTempADC += ADC12MEM0;
-		++iSamples;
-	}
-
-	static llong ovflCount[NumOsc];
+	static ulong ovflCount[NumOsc];
   switch (TIVs) { // each read resets the highest pending interrupt flag
 		case 0xE : // overflow only - lowest priority -> can interrupt before/after edge capture
 		  ++ovflCount[oscIdx];
@@ -414,10 +408,15 @@ bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
 	}
 
   // 1 PPS edge
-
 	counts[oscIdx].LSW = TCCR1;
 	if (++secs[oscIdx] <= 0)
-	 	initial[oscIdx] = counts[oscIdx].llongv;
+	 	initial[oscIdx] = counts[oscIdx].ullongv;
+
+	if (oscIdx == 0) {
+	  // TB0CCR0 = TB0R + PPS_WDT_Ticks; // reset watchdog for missing 1PPS pulses - not used
+		iTempADC += ADC12MEM0;
+		++iSamples;
+	}
 
 	ppsEdge |= 1 << oscIdx;
 	return true;
@@ -468,7 +467,7 @@ void init1PPS() {
 
   TB0CTL = TASSEL_1 | MC_2 | TACLR | TAIE; // ACLK
   TB0CCR0 = TB0R + PPS_WDT_Ticks;
-  TB0CCTL0 = CCIE;  // 1PPS watchdog
+  // TB0CCTL0 = CCIE;  // 1PPS watchdog
 }
 
 bool setNomHz(int osc) {
@@ -499,7 +498,7 @@ bool setNomHz(int osc) {
 	const int K1100tol = 10000; // 1 / 0.01%
 	const int K1114tol = 2000;  // 1 / 0.05%
 
-	long Hz = (counts[osc].llongv - initial[osc]) / secs[osc];  // measured
+	long Hz = (counts[osc].ullongv - initial[osc]) / secs[osc];  // measured
 
 	int f = 0;
 	if (labs(Hz - (Hz + 50000) / 100000 * 100000) <= Hz / K1100tol)   // within 1kHz of N * 100kHz
@@ -533,41 +532,41 @@ bool setNomHz(int osc) {
 
 
 void reportMHz() {
+	sendTime();
+	sendTemp();
+
 	bool newXtal = false;
 	for (uint osc = 0; osc < NumOsc; ++osc) {
 		if (NomHz[osc] <= 0) {
-			bool setNom = setNomHz(osc);
-			if (setNom && !newXtal)
-				sendTime();
-			if (setNom) {
+			if (setNomHz(osc)) {
 			  newXtal = true;
-			  if (!(NomHz[osc] % 1000000))
-			  	sendDec(NomHz[osc] / 1000000, " MHz, ");
-			  else if (!(NomHz[osc] % 1000))
-			  	sendDec(NomHz[osc] / 1000, " kHz, ");
-			  else sendDec(NomHz[osc]);
+			  int decimals = 6;
+			  long Hz = NomHz[osc] % 1000000;
+			  while (decimals && Hz % 10 == 0) {
+			  	--decimals;
+          Hz /= 10;
+			  }
+			  sendDec(NomHz[osc] / 1000000, ".");
+			  sendDec(Hz, ", ", decimals);
 			}
 		}
 	}
-	if (newXtal) send('\n');
 
-	sendTime();
-	for (uint osc = 0; osc < NumOsc; ++osc) {
+	if (!newXtal)	for (uint osc = 0; osc < NumOsc; ++osc) {
 		// First few PPM error reports differ from later:
 		//  32KHz: truncation: 1 count = 30 ppm / 2s = 15 ppm
 		//  others: short-term frequency instability?, Vcc dip?
 
-		llong xtalCounts = counts[osc].llongv - initial[osc];
+		ullong xtalCounts = counts[osc].ullongv - initial[osc];
 		int nomSecs = (xtalCounts + NomHz[osc] / 2) / NomHz[osc];  // 10 PPM -> off after 14 hrs
 		if (nomSecs) {
 			const long resolution = 1000000000; // PPB
-		  long ppRes = (xtalCounts - (llong)NomHz[osc] * nomSecs) * resolution / nomSecs / NomHz[osc];
+		  long ppRes = ((llong)xtalCounts - (llong)NomHz[osc] * nomSecs) * resolution / nomSecs / NomHz[osc];
 	    sendDec((long)(ppRes / (resolution / 1000000)), "."); // PPM
 	    sendDec((long)(abs(ppRes) % (resolution / 1000000)), ", ", 3);  // digits beyond PPM decimal
 		} else send("off, ");
 	}
-
-  sendTemp();
+  send('\n');
 }
 
 long reportSecs = 2;
