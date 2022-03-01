@@ -4,7 +4,10 @@
 
 // 1PPS has extra pulses and missing pulses
 
-// TTL oscillator signals OK (3.6V Voh drive)
+// TODO: 55 MHz gained ovfl? ~ 1.8 change;  chk with 5340
+// happened after 2:13 ~8000s
+
+// TTL overshoot latch-up?
 
 #include <msp430.h> 
 #include <stdlib.h>
@@ -364,7 +367,7 @@ const uint watchdogMargin = 1;  // TB0CCR0 interrupt jitter between setting/chec
 const uint PPS_WDT_Ticks = 32768 + watchdogMargin;
 
 const int NumOsc = 4;
-long NomHz[NumOsc];
+long nomHz[NumOsc];
 
 volatile long secs[NumOsc] = {-1, -1, -1, -1};
 volatile int ppsEdge;
@@ -464,7 +467,7 @@ void init1PPS() {
   // TB0CCTL0 = CCIE;  // 1PPS watchdog
 }
 
-long reportSecs = 2;
+long reportSecs = 3;
 
 bool setNomHz(int osc) {
 	const long xtalHz[] = {32768,
@@ -517,15 +520,15 @@ bool setNomHz(int osc) {
 				 send("Non-std:");
 			else {
 				lastNonStdHz = Hz;
-				NomHz[osc] = 0;
+				nomHz[osc] = 0;
 				secs[osc] = -1;
 				return false;
 			}
 		}
 	}
 
-	reportSecs = 2;
-	NomHz[osc] = Hz;
+	reportSecs = 3;
+	nomHz[osc] = Hz;
 	return true;
 }
 
@@ -536,16 +539,16 @@ void reportMHz() {
 
 	bool newXtal = false;
 	for (uint osc = 0; osc < NumOsc; ++osc) {
-		if (NomHz[osc] <= 0) {
+		if (nomHz[osc] <= 0) {
 			if (setNomHz(osc)) {
 			  newXtal = true;
 			  int decimals = 6;
-			  long Hz = NomHz[osc] % 1000000;
+			  long Hz = nomHz[osc] % 1000000;
 			  while (decimals && Hz % 10 == 0) {
 			  	--decimals;
           Hz /= 10;
 			  }
-			  sendDec(NomHz[osc] / 1000000, ".");
+			  sendDec(nomHz[osc] / 1000000, ".");
 			  sendDec(Hz, ", ", decimals);
 			}
 		}
@@ -556,14 +559,18 @@ void reportMHz() {
 		//  32KHz: truncation: 1 count = 30 ppm / 2s = 15 ppm
 		//  others: short-term frequency instability?, Vcc dip?
 
-		ullong xtalCounts = counts[osc].ullongv - initial[osc];
-		int nomSecs = (xtalCounts + NomHz[osc] / 2) / NomHz[osc];  // 10 PPM -> off after 14 hrs
-		if (nomSecs) {
-			const long resolution = 1000000000; // PPB
-		  long ppRes = ((llong)xtalCounts - (llong)NomHz[osc] * nomSecs) * resolution / nomSecs / NomHz[osc];
-	    sendDec((long)(ppRes / (resolution / 1000000)), "."); // PPM
-	    sendDec((long)(abs(ppRes) % (resolution / 1000000)), ", ", 3);  // digits beyond PPM decimal
-		} else send("off, ");
+		if (nomHz[osc]) {
+			ullong xtalCounts = counts[osc].ullongv - initial[osc];
+			int nomSecs = (xtalCounts + nomHz[osc] / 2) / nomHz[osc];  // 10 PPM -> off after 14 hrs
+			if (nomSecs) {
+				const long resolution = 1000000000; // PPB
+				long ppRes = ((llong)xtalCounts - (llong)nomHz[osc] * nomSecs) * resolution / nomSecs / nomHz[osc];
+				sendDec((long)(ppRes / (resolution / 1000000)), "."); // PPM
+				sendDec((long)(abs(ppRes) % (resolution / 1000000)), ", ", 3);  // digits beyond PPM decimal
+				continue;
+			}
+		}
+	  send("off, ");
 	}
   send('\n');
 }
@@ -586,7 +593,7 @@ void chk1PPS() {
 
   if (ppsEdge == 7) { // all but ZIF xtal clock
 		secs[3] = -1;
-		NomHz[3] = 0;
+		nomHz[3] = 0;
   }
 	ppsEdge = 0;  // or one at a time
 }
@@ -647,9 +654,9 @@ void chkSerCmd() {
 		case 'Z':
 			secs[0] = secs[1] = secs[2] = secs[3] = -1;
 		case 'X' :
-			NomHz[3] = 0;
+			nomHz[3] = 0;
 			secs[3] = -1;
-			reportSecs = 2;
+			reportSecs = 3;
 		  break;
 	}
 	negative = false;
@@ -659,7 +666,7 @@ void chkSerCmd() {
 void main() {
  	WDTCTL = WDTPW | WDTHOLD;
 
-  initPins();
+ 	initPins();
 	initClocks();
 	initRTC();
 
