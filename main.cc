@@ -4,7 +4,7 @@
 
 // 1PPS has extra pulses and missing pulses
 
-// TODO: 55 MHz gained ovfl? ~ 1.8 change;  chk with 5340
+// TODO: 55 MHz ovfls? ~ 1.8 change;  chk with 5340
 // happened after 2:13 ~8000s
 
 // TTL overshoot latch-up?
@@ -380,18 +380,19 @@ volatile union {
 	ullong ullongv;  // 48 bits incremented -- 1000 hrs of 55 MHz
   struct {
     uint LSW;
-    ulong MSW;
+    ulong MSW;  // or ullong for > 1000 hrs
   };
 } counts[NumOsc];
 
+bool oscIntrpt(volatile uint* TIV, uint oscIdx, uint TCCR1) {  // returns sample ready
+	static ulong ovflCount[NumOsc]; // or ullong for > 1000 hrs
 
-// TODO: socketed xtal occasionally misses an overflow count?
-
-bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
-	static ulong ovflCount[NumOsc];
-  switch (TIVs) {
+	 __bic_SR_register(GIE);  // prevent PPS intrpt during ovfl service: can delay/lose ovfl count
+  switch (*TIV + *TIV) {
 		case 0xE : // overflow only - lowest priority -> can interrupt before/after edge capture
 		  ++ovflCount[oscIdx];
+		case 0 :
+		  __bis_SR_register(GIE);
 		  return false;
 
   	case 2 :   // just edge capture
@@ -407,6 +408,8 @@ bool oscIntrpt(int TIVs, uint oscIdx, uint TCCR1) {  // returns sample ready
 		    counts[oscIdx].MSW = ovflCount[oscIdx]++;
 			break;
 	}
+
+  __bis_SR_register(GIE);
 
   // 1 PPS edge
 	counts[oscIdx].LSW = TCCR1;
@@ -431,25 +434,25 @@ __interrupt void TIMER0_B0_ISR_HOOK(void) {  // 1PPS watchdog
 
 #pragma vector=TIMER0_B1_VECTOR
 __interrupt void TIMER0_B1_ISR_HOOK(void) {
-  if (oscIntrpt(TB0IV + TB0IV, 0, TB0CCR1)) // each read resets the highest pending interrupt flag
+  if (oscIntrpt(&TB0IV, 0, TB0CCR1)) // each read resets the highest pending interrupt flag
 	  __bic_SR_register_on_exit(LPM0_bits); // Exit LPM0
 }
 
 #pragma vector=TIMER0_A1_VECTOR
 __interrupt void TIMER0_A1_ISR_HOOK(void) {
-	if (oscIntrpt(TA0IV + TA0IV, 1, TA0CCR1))
+	if (oscIntrpt(&TA0IV, 1, TA0CCR1))
 		__bic_SR_register_on_exit(LPM0_bits);
 }
 
 #pragma vector=TIMER1_A1_VECTOR
 __interrupt void TIMER1_A1_ISR_HOOK(void) {
-	if (oscIntrpt(TA1IV + TA1IV, 2, TA1CCR1))
+	if (oscIntrpt(&TA1IV, 2, TA1CCR1))
 		__bic_SR_register_on_exit(LPM0_bits);
 }
 
 #pragma vector=TIMER2_A1_VECTOR
 __interrupt void TIMER2_A1_ISR_HOOK(void) { // socketed xtal
-	if (oscIntrpt(TA2IV + TA2IV, 3, TA2CCR1))
+	if (oscIntrpt(&TA2IV, 3, TA2CCR1))
 	  __bic_SR_register_on_exit(LPM0_bits);
 }
 
@@ -591,7 +594,7 @@ void chk1PPS() {
     } else reportSecs <<= 1;
 	}
 
-  if (ppsEdge == 7) { // all but ZIF xtal clock
+  if (ppsEdge == 7) { // all but ZIF xtal clock -- why happening?
 		secs[3] = -1;
 		nomHz[3] = 0;
   }
